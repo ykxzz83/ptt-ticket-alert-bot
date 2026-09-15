@@ -1,20 +1,19 @@
 # PTT Ticket Alert Bot
 
-A real-time ticket-post monitoring and notification bot for Taiwan's PTT Drama-Ticket board.
-
-The application continuously reads the board's RSS feed, retrieves article content, and sends new ticket-post alerts through messaging platforms such as Telegram and LINE.
+A lightweight real-time monitoring service for Taiwan's PTT Drama-Ticket board. It polls the board's RSS feed, retrieves article content, optionally filters posts by keywords, and sends matching ticket alerts to Telegram.
 
 ## Features
 
-- Monitor the PTT Drama-Ticket RSS feed in near real time
-- Retrieve and parse article content automatically
-- Filter posts using configurable keywords
-- Prevent duplicate notifications during a running session
-- Send alerts through Telegram Bot API
-- Support LINE Messaging API in the keyword-filtering version
-- Deploy as a Flask web service with Gunicorn and Render
+- Monitor the PTT Drama-Ticket RSS feed automatically
+- Scrape article content with Requests and BeautifulSoup
+- Optional keyword filtering through an environment variable
+- Avoid duplicate notifications during the current process lifetime
+- Send alerts through the Telegram Bot API
+- Configurable polling interval
+- Health endpoint for deployment monitoring
+- Deploy with Flask, Gunicorn, and Render
 
-## How It Works
+## Architecture
 
 ```text
 PTT Drama-Ticket
@@ -27,13 +26,16 @@ PTT Drama-Ticket
        |
        v
 Article Retrieval
-(requests + BeautifulSoup)
+Requests + BeautifulSoup
        |
        v
-Keyword Filtering / Deduplication
+ Optional Keyword Filter
        |
        v
-Telegram / LINE Notification
+ In-memory Deduplication
+       |
+       v
+ Telegram Bot API
 ```
 
 ## Tech Stack
@@ -45,50 +47,70 @@ Telegram / LINE Notification
 - BeautifulSoup4
 - Gunicorn
 - Telegram Bot API
-- LINE Messaging API
 - Render
 
 ## Project Structure
 
 ```text
 .
-├── app.py              # Main Telegram notification application
-├── main_mayday.py      # Keyword-filtering LINE notification version
+├── app.py              # Application and RSS monitoring logic
 ├── render.yaml         # Render deployment configuration
 ├── requirements.txt    # Python dependencies
 ├── pyproject.toml      # Poetry project configuration
+├── poetry.lock         # Locked Poetry dependencies
+├── .gitignore
 └── README.md
 ```
 
-## Main Workflow
+## How It Works
 
 1. Poll the PTT Drama-Ticket RSS feed.
-2. Detect posts that have not been processed during the current session.
-3. Fetch each article page and extract its text content.
-4. Create a short preview of the post.
-5. Send the alert through the configured messaging API.
-6. Record the article URL in memory to avoid duplicate alerts.
+2. Skip posts already processed during the current session.
+3. Fetch and parse each new article.
+4. Apply keyword filtering when `KEYWORDS` is configured.
+5. Build a short article preview.
+6. Send matching posts to Telegram.
 
 ## Configuration
 
-The application uses environment variables for messaging credentials. Do not commit API tokens or secrets to the repository.
+Configure the application with environment variables. API tokens and credentials should never be committed to the repository.
 
-For the Telegram version (`app.py`):
+| Variable | Required | Description |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Yes | Destination chat ID |
+| `KEYWORDS` | No | Comma-separated keywords; empty means send all posts |
+| `POLL_INTERVAL` | No | RSS polling interval in seconds; default is `30` |
+| `PTT_RSS_URL` | No | RSS source URL |
+
+Example keyword configuration:
 
 ```text
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
+KEYWORDS=五月天,讓票,徵票,mayday
 ```
 
-For the LINE version (`main_mayday.py`):
+## Run Locally
 
-```text
-LINE_CHANNEL_ACCESS_TOKEN
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
 ```
+
+Set the required environment variables and start the service:
+
+```bash
+gunicorn app:app
+```
+
+The application exposes:
+
+- `/` — service status and configured keyword filter
+- `/health` — lightweight health check
 
 ## Deployment
 
-The project includes a `render.yaml` configuration for deployment on Render. The web service runs with:
+`render.yaml` contains the Render web-service configuration. The deployed service runs with:
 
 ```bash
 gunicorn app:app
@@ -96,21 +118,19 @@ gunicorn app:app
 
 ## Current Limitations
 
-- Processed article URLs are stored only in memory, so the duplicate history is reset when the service restarts.
-- Running multiple Gunicorn workers could start multiple monitoring threads.
-- RSS polling and notification processing currently run inside the Flask application process.
-
-Possible future improvements include persistent storage with Redis or a database, a dedicated background worker, configurable polling intervals, structured logging, and monitoring.
+- Processed URLs are stored in memory and reset after a restart.
+- The RSS monitor runs in a background thread inside the web process.
+- Multiple Gunicorn workers could create duplicate monitoring loops.
 
 ## Future Improvements
 
-- Persist processed posts using Redis or a database
-- Separate background monitoring from the Flask web server
-- Add configurable keywords and polling intervals
-- Extract structured ticket information such as event, date, venue, quantity, and price
-- Add analytics and visualization for ticket-post trends
-- Apply NLP models for ticket classification or suspicious-post detection
+- Persist processed posts with Redis or a database
+- Move RSS monitoring to a dedicated background worker
+- Add automated tests and CI
+- Extract structured fields such as event, date, venue, quantity, and price
+- Build analytics for ticket-post volume and trends
+- Apply NLP for post classification and information extraction
 
 ## Author
 
-Sandy
+Yu-shan Huang
