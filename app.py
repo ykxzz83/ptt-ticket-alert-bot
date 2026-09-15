@@ -1,119 +1,143 @@
-from flask import Flask, request
-import requests
-import feedparser
-from bs4 import BeautifulSoup
-import time
-import threading
-import json
+import logging
 import os
+import threading
+import time
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ====== 設定 ======
-RSS_URL = "https://www.ptt.cc/atom/Drama-Ticket.xml"
-# GROUP_ID = "Cb3407b511a09301d4f2617a500ea5ce1"
-# CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+RSS_URL = os.getenv("PTT_RSS_URL", "https://www.ptt.cc/atom/Drama-Ticket.xml")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+KEYWORDS = [
+    keyword.strip().lower()
+    for keyword in os.getenv("KEYWORDS", "").split(",")
+    if keyword.strip()
+]
 
-sent_links = set()
+REQUEST_TIMEOUT = 10
+PREVIEW_LENGTH = 200
+sent_links: set[str] = set()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
-# ✅ 改用 Telegram 發送訊息
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+def fetch_article_content(link: str) -> str:
+    """Fetch and extract the main text from a PTT article."""
     try:
-        res = requests.post(url, data=payload)
-        if res.status_code != 200:
-            print(f"❌ 發送失敗（{res.status_code}）：{res.text}")
-        else:
-            print("🔔 發送狀態：200")
-    except Exception as e:
-        print("❌ 發送過程錯誤：", e)
+        response = requests.get(
+            link,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        response.encoding = "utf-8"
 
-
-# （以下 LINE 用法已註解）
-# def send_line_message(text):
-#     url = "https://api.line.me/v2/bot/message/push"
-#     headers = {
-#         "Content-Type": "application/json",
-#         "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
-#     }
-#     payload = {"to": GROUP_ID, "messages": [{"type": "text", "text": text}]}
-#     try:
-#         res = requests.post(url, headers=headers, json=payload)
-#         if res.status_code != 200:
-#             print(f"❌ 發送失敗（{res.status_code}）：{res.text}")
-#         else:
-#             print("🔔 發送狀態：200")
-#     except Exception as e:
-#         print("❌ 發送過程錯誤：", e)
-
-
-def fetch_article_content(link):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(link, headers=headers)
-        resp.encoding = 'utf-8'
-        soup = BeautifulSoup(resp.text, "html.parser")
-        content_div = soup.find("div", id="main-content")
-        return content_div.get_text(strip=True) if content_div else ""
-    except Exception as e:
-        print("❌ 取得內文失敗：", e)
+        soup = BeautifulSoup(response.text, "html.parser")
+        content = soup.find("div", id="main-content")
+        return content.get_text(" ", strip=True) if content else ""
+    except requests.RequestException as exc:
+        logger.warning("Failed to fetch article %s: %s", link, exc)
         return ""
 
 
-def monitor_rss():
-    print("🟢 monitor_rss 啟動中...")
+def matches_keywords(title: str, content: str) -> bool:
+    """Return True when no filter is configured or a keyword is matched."""
+    if not KEYWORDS:
+        return True
+
+    text = f"{title} {content}".lower()
+    return any(keyword in text for keyword in KEYWORDS)
+
+
+def send_telegram_message(text: str) -> bool:
+    """Send an alert through the Telegram Bot API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram credentials are not configured.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    try:
+        response = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        logger.error("Failed to send Telegram alert: %s", exc)
+        return False
+
+
+def process_feed() -> None:
+    """Process one snapshot of the configured RSS feed."""
+    feed = feedparser.parse(RSS_URL)
+
+    if getattr(feed, "bozo", False):
+        logger.warning("RSS parser reported an issue: %s", feed.bozo_exception)
+
+    for entry in feed.entries:
+        title = entry.title.strip()
+        link = entry.link
+
+        if link in sent_links:
+            continue
+
+        content = fetch_article_content(link)
+
+        if not matches_keywords(title, content):
+            sent_links.add(link)
+            continue
+
+        preview = content[:PREVIEW_LENGTH]
+        if len(content) > PREVIEW_LENGTH:
+            preview += "..."
+
+        message = f"📌 {title}\n\n📝 {preview}\n\n🔗 {link}"
+
+        if send_telegram_message(message):
+            sent_links.add(link)
+            logger.info("Alert sent: %s", title)
+
+
+def monitor_rss() -> None:
+    """Continuously poll the RSS feed for new ticket posts."""
+    logger.info("PTT ticket monitor started. Poll interval: %s seconds", POLL_INTERVAL)
+
     while True:
-        print("\n⏱ 正在檢查 RSS 更新...\n")
         try:
-            feed = feedparser.parse(RSS_URL)
-            print(f"📥 共取得 {len(feed.entries)} 篇文章")
+            process_feed()
+        except Exception:
+            logger.exception("Unexpected error while processing RSS feed")
 
-            for i, entry in enumerate(feed.entries):
-                title = entry.title.strip()
-                link = entry.link
-                print(f"\n📄 第 {i+1} 篇：{title}")
-                print(f"🔗 連結：{link}")
-
-                if link in sent_links:
-                    print("⏭ 已發送過，略過")
-                    continue
-
-                print("📑 抓取內文中...")
-                content = fetch_article_content(link)
-                preview = content[:100] + ("..." if len(content) > 100 else "")
-
-                msg = (f"📌 標題：{title}\n"
-                       f"📝 內文摘要：\n{preview}"
-                       f"🔗 連結：{link}\n\n")
-
-                print("📤 準備發送訊息到 Telegram...")
-                send_telegram_message(msg)
-                sent_links.add(link)
-                print("✅ 發送完成 ✅")
-
-        except Exception as e:
-            print("❌ RSS 檢查錯誤：", e)
-
-        print("\n🕒 等待 10 秒後再次檢查...\n")
-        time.sleep(10)
+        time.sleep(POLL_INTERVAL)
 
 
-@app.route("/")
+@app.get("/")
 def home():
-    return "✅ PTT RSS 全文推播伺服器運行中"
+    return jsonify(
+        status="ok",
+        service="ptt-ticket-alert-bot",
+        keyword_filter=KEYWORDS,
+    )
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    print("📦 收到請求：", json.dumps(data, indent=2, ensure_ascii=False))
-    return "OK"
+@app.get("/health")
+def health():
+    return jsonify(status="healthy")
 
 
-# ✅ 背景監控
-threading.Thread(target=monitor_rss, daemon=True).start()
+# Start one background monitor for the current application process.
+monitor_thread = threading.Thread(target=monitor_rss, daemon=True, name="rss-monitor")
+monitor_thread.start()
